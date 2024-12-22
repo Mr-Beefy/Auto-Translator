@@ -1,0 +1,744 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, colorchooser
+import pyautogui
+import time
+import json
+import os
+import threading
+from PIL import ImageGrab, ImageEnhance, ImageFilter
+import pytesseract
+from googletrans import Translator
+import webbrowser
+import difflib
+import sys
+
+
+# Determine the base path for locating the icon
+if getattr(sys, 'frozen', False):  # Check if running as a bundled executable
+    base_path = sys._MEIPASS
+else:
+    base_path = os.path.dirname(__file__)
+
+icon_path = os.path.join(base_path, "Translator icon.ico")
+
+# Set Tesseract path relative to the app
+base_path = getattr(sys, '_MEIPASS', os.path.dirname(__file__))
+pytesseract.pytesseract.tesseract_cmd = os.path.join(base_path, "Tesseract-OCR", "tesseract.exe")
+os.environ["TESSDATA_PREFIX"] = os.path.join(base_path, "Tesseract-OCR", "tessdata")
+
+# File to save coordinates and settings
+SETTINGS_FILE = "settings.json"
+
+# Function to save settings
+def save_settings(settings, width=None, height=None):
+    # Ensure resolution settings are included before saving
+    if width is not None and height is not None:
+        settings["resolution"] = {"width": width, "height": height}
+
+    # Save settings to the JSON file
+    with open(SETTINGS_FILE, "w") as f:
+        json.dump(settings, f)
+
+
+
+# Function to load settings
+def load_settings():
+    default_settings = {
+        "perimeter": None,
+        "chat_bar": None,
+        "auto_clear_time": 0,
+        "language": "en",
+        "show_original": True,
+        "check_interval": 2,
+        "channel_color": "#4CAF50",  # Soft green for channels
+        "chat_color": "#37474F",  # Muted dark blue-gray for chat text
+        "print_translated_only": False,  # New setting to control printed text behavior
+        "auto_send": False,  # New setting for auto send feature
+        "resolution": {"width": "1920", "height": "1080"}  # Default resolution
+
+    }
+    if not os.path.exists(SETTINGS_FILE):
+        save_settings(default_settings)
+
+    # Check if the settings file exists
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, "r") as f:
+                loaded_settings = json.load(f)
+
+            # Ensure all keys in default settings exist in the loaded settings
+            for key, value in default_settings.items():
+                if key not in loaded_settings:
+                    loaded_settings[key] = value
+
+            return loaded_settings  # Return the loaded settings
+
+        except (json.JSONDecodeError, IOError):  # Handle file reading or JSON errors
+            messagebox.showerror("Error", "Failed to load settings. Resetting to defaults.")
+
+    # If file does not exist or an error occurs, return default settings
+    return default_settings
+
+# Preprocessing function to enhance image quality
+def preprocess_image(image):
+    # Convert to grayscale
+    grayscale_image = image.convert("L")
+    # Increase contrast
+    enhancer = ImageEnhance.Contrast(grayscale_image)
+    contrast_image = enhancer.enhance(2.0)
+    # Apply a sharpen filter
+    sharpened_image = contrast_image.filter(ImageFilter.SHARPEN)
+    # Thresholding
+    threshold_image = sharpened_image.point(lambda p: p > 128 and 255)
+    return threshold_image
+
+class AutoTranslateGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Auto Translate Tool")
+        self.root.geometry("850x750")
+        self.root.configure(bg="#1A202C")
+
+        # Initialize resolution variables
+        self.width_var = tk.StringVar(value="1920")
+        self.height_var = tk.StringVar(value="1080")
+
+        # Initialize translator
+        self.translator = Translator()
+
+        # Load saved settings
+        self.settings = load_settings()
+
+        if "resolution" in self.settings:
+            self.width_var.set(self.settings["resolution"]["width"])
+            self.height_var.set(self.settings["resolution"]["height"])
+
+        # Define GUI components
+        header_frame = tk.Frame(root, bg="#2C5282", highlightthickness=0, relief="solid", bd=2)
+        header_frame.pack(fill=tk.X, pady=3)
+        tk.Label(
+            header_frame,
+            text="Auto Translate Tool",
+            font=("Segoe UI", 20, "bold"),
+            fg="#FFFFFF",
+            bg="#2C5282",
+        ).pack(pady=3)
+
+        # Message text field (used in set_dpi_scaling)
+        self.message_frame = tk.Frame(root, bg="#1A202C", highlightthickness=2, highlightbackground="#2C5282")
+        self.message_frame.pack(pady=3, fill=tk.BOTH, expand=True)
+        ttk.Label(self.message_frame, text="Chat Box:", font=("Segoe UI", 14, "bold"), foreground="#E2E8F0", background="#1A202C").pack(anchor=tk.W, padx=10, pady=3)
+        self.message_text = tk.Text(
+            self.message_frame, wrap=tk.WORD, height=5, bg="#2D3748", fg="#E2E8F0", font=("Segoe UI", 11), bd=0, highlightthickness=0
+        )
+        self.message_scrollbar = tk.Scrollbar(self.message_frame, command=self.message_text.yview)
+        self.message_text.configure(yscrollcommand=self.message_scrollbar.set)
+        self.message_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.message_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=3)
+
+        # Options Menu Button
+        self.options_button = tk.Button(
+            root, text="⋮", command=self.open_options_window, font=("Segoe UI", 12), bg="#4A5568", fg="#E2E8F0",
+            relief="flat", bd=0, highlightbackground="#4A5568", highlightthickness=2
+        )
+        self.options_button.place(x=10, y=10, width=40, height=40)
+
+        # Define Language Selection
+        self.language_frame = tk.Frame(root, bg="#1A202C")
+        self.language_frame.pack(pady=3, padx=10, anchor="w")
+        ttk.Label(self.language_frame, text="Select Your Language:", font=("Segoe UI", 12), foreground="#E2E8F0", background="#1A202C").pack(side=tk.LEFT, padx=5)
+        self.language_var = tk.StringVar(value=self.settings.get("language", "en"))
+        self.language_dropdown = ttk.Combobox(
+            self.language_frame, textvariable=self.language_var, values=["en", "fr", "es"], font=("Segoe UI", 10)
+        )
+        self.language_dropdown.pack(side=tk.LEFT, padx=5)
+        self.language_dropdown.bind("<<ComboboxSelected>>", self.update_language)
+
+
+        # Print Translated Only Option
+        self.print_translated_only_var = tk.BooleanVar(value=self.settings.get("print_translated_only", False))
+        self.print_translated_only_checkbox = ttk.Checkbutton(
+            self.language_frame,
+            text="Print Translated Only",
+            variable=self.print_translated_only_var,
+            command=self.update_print_translated_only,
+            style="Custom.TCheckbutton"
+        )
+        self.print_translated_only_checkbox.pack(side=tk.LEFT, padx=10)
+
+        # Define Perimeter Section
+        self.perimeter_frame = tk.Frame(root, bg="#1A202C")
+        self.perimeter_frame.pack(pady=3, padx=10, anchor="w")
+        ttk.Label(self.perimeter_frame, text="Perimeter Coordinates:", font=("Segoe UI", 12), foreground="#E2E8F0", background="#1A202C").pack(side=tk.LEFT, padx=5)
+        self.perimeter_label = ttk.Label(
+            self.perimeter_frame, text=str(self.settings["perimeter"] or "Not Set"), font=("Segoe UI", 12), foreground="#E2E8F0", background="#1A202C"
+        )
+        self.perimeter_label.pack(side=tk.LEFT, padx=5)
+        self.perimeter_button = ttk.Button(
+            self.perimeter_frame, text="Set Perimeter", command=self.set_perimeter, style="Rounded.TButton"
+        )
+        self.perimeter_button.pack(side=tk.LEFT, padx=10)
+
+        # Chat Bar Section
+        self.chat_bar_frame = tk.Frame(root, bg="#1A202C")
+        self.chat_bar_frame.pack(pady=3, padx=10, anchor="w")
+        ttk.Label(self.chat_bar_frame, text="Chat Bar Coordinates:", font=("Segoe UI", 12), foreground="#E2E8F0", background="#1A202C").pack(side=tk.LEFT, padx=5)
+        self.chat_bar_label = ttk.Label(
+            self.chat_bar_frame, text=str(self.settings["chat_bar"] or "Not Set"), font=("Segoe UI", 12), foreground="#E2E8F0", background="#1A202C"
+        )
+        self.chat_bar_label.pack(side=tk.LEFT, padx=5)
+        self.chat_bar_button = ttk.Button(
+            self.chat_bar_frame, text="Set Chat Bar", command=self.set_chat_bar, style="Rounded.TButton"
+        )
+        self.chat_bar_button.pack(side=tk.LEFT, padx=10)
+
+        # Interval Adjustment
+        self.interval_frame = tk.Frame(root, bg="#1A202C")
+        self.interval_frame.pack(pady=3, padx=10, anchor="w")
+        ttk.Label(self.interval_frame, text="Check Interval (seconds):", font=("Segoe UI", 12), foreground="#E2E8F0", background="#1A202C").pack(
+            side=tk.LEFT, padx=5
+        )
+        self.interval_var = tk.IntVar(value=self.settings.get("check_interval", 2))
+        self.interval_entry = ttk.Entry(self.interval_frame, textvariable=self.interval_var, width=10)
+        self.interval_entry.pack(side=tk.LEFT, padx=5)
+        self.interval_button = ttk.Button(
+            self.interval_frame, text="Set Interval", command=self.update_check_interval, style="Rounded.TButton"
+        )
+        self.interval_button.pack(side=tk.LEFT, padx=10)
+
+
+        self.message_scrollbar = tk.Scrollbar(self.message_frame, command=self.message_text.yview)
+        self.message_text.configure(yscrollcommand=self.message_scrollbar.set)
+        self.message_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.message_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=3)
+        self.message_text.bind("<Configure>", self.auto_scroll)
+
+        # Start/Stop Buttons (Fixed relative to Chat Box)
+        self.button_frame = tk.Frame(root, bg="#1A202C")  # Create a frame to hold the buttons
+        self.button_frame.pack(anchor="ne", pady=5, padx=10)  # Place it near the bottom right of the chat box
+
+        # Add the buttons inside the frame
+        self.start_button = tk.Button(
+            self.button_frame, text="Start", command=self.start_translation,
+            bg="#2C5282", fg="#FFFFFF", font=("Segoe UI", 14, "bold"), relief="flat", width=10
+        )
+        self.start_button.grid(row=0, column=0, padx=5)  # Place the Start button to the left
+
+        self.stop_button = tk.Button(
+            self.button_frame, text="Stop", command=self.stop_translation,
+            bg="#E53E3E", fg="#FFFFFF", font=("Segoe UI", 14, "bold"), relief="flat", width=10
+        )
+        self.stop_button.grid(row=0, column=1, padx=5)  # Place the Stop button to the right
+
+        # User Chat Input Section
+        self.input_frame = tk.Frame(root, bg="#1A202C")
+        self.input_frame.pack(pady=3, fill=tk.X)
+        ttk.Label(self.input_frame, text="Your Message:", font=("Segoe UI", 12), foreground="#E2E8F0", background="#1A202C").pack(side=tk.LEFT, padx=10)
+        self.user_input = ttk.Entry(self.input_frame, width=50)
+        self.user_input.pack(side=tk.LEFT, padx=10)
+
+        # Target Language Dropdown
+        ttk.Label(self.input_frame, text="Translate To:", font=("Segoe UI", 12), foreground="#E2E8F0", background="#1A202C").pack(side=tk.LEFT, padx=10)
+        self.translate_to_var = tk.StringVar(value="fr")
+        self.translate_to_dropdown = ttk.Combobox(
+            self.input_frame, textvariable=self.translate_to_var, values=["fr", "es"], font=("Segoe UI", 10)
+        )
+        self.translate_to_dropdown.pack(side=tk.LEFT, padx=10)
+
+        # Auto Send Option
+        self.auto_send_var = tk.BooleanVar(value=self.settings.get("auto_send", False))
+        self.auto_send_checkbox = ttk.Checkbutton(
+            self.input_frame,
+            text="Auto Send",
+            variable=self.auto_send_var,
+            command=self.update_auto_send,
+            style="Custom.TCheckbutton"
+        )
+        self.auto_send_checkbox.pack(side=tk.LEFT, padx=10)
+
+        from tkinter.font import Font
+
+        # Define a custom font for the button
+        button_font = Font(family="Segoe UI", size=5, weight="bold")
+
+        # Paste and Translate Section
+        self.paste_translate_frame = tk.Frame(root, bg="#1A202C")
+        self.paste_translate_frame.pack(pady=3, fill=tk.X)
+        ttk.Label(self.paste_translate_frame, text="Paste and Translate:", font=("Segoe UI", 12), foreground="#E2E8F0", background="#1A202C").pack(side=tk.LEFT, padx=10)
+        self.paste_translate_input = ttk.Entry(self.paste_translate_frame, width=50)
+        self.paste_translate_input.pack(side=tk.LEFT, padx=10)
+        self.paste_translate_button = tk.Button(
+            self.paste_translate_frame,
+            text="Translate",
+            command=self.paste_and_translate,
+            bg="#2C5282",
+            fg="#FFFFFF",
+            font=("Segoe UI", 12, "bold"),
+            relief="flat",
+        )
+        self.paste_translate_button.pack(side=tk.LEFT, padx=10)
+
+        # Clear Chat Options
+        self.clear_chat_frame = tk.Frame(root, bg="#1A202C")
+        self.clear_chat_frame.pack(pady=3, fill=tk.X)
+        self.clear_button = tk.Button(
+            self.clear_chat_frame,
+            text="Delete Chat",
+            command=self.clear_chat,
+            bg="#E53E3E",
+            fg="#FFFFFF",
+            font=("Segoe UI", 12, "bold"),
+            relief="flat",
+        )
+        self.clear_button.pack(side=tk.LEFT, padx=10)
+        ttk.Label(self.clear_chat_frame, text="Auto Clear Timer (seconds):", font=("Segoe UI", 12), foreground="#E2E8F0", background="#1A202C").pack(
+            side=tk.LEFT, padx=10
+        )
+        self.auto_clear_time_var = tk.IntVar(value=self.settings.get("auto_clear_time"))
+        self.auto_clear_entry = ttk.Entry(self.clear_chat_frame, textvariable=self.auto_clear_time_var, width=10)
+        self.auto_clear_entry.pack(side=tk.LEFT, padx=10)
+        self.save_timer_button = tk.Button(
+            self.clear_chat_frame,
+            text="Set Timer",
+            command=self.set_timer,
+            bg="#2C5282",
+            fg="#FFFFFF",
+            font=("Segoe UI", 12, "bold"),
+            relief="flat",
+        )
+        self.save_timer_button.pack(side=tk.LEFT, padx=10)
+
+        # Track printed messages and recent lines
+        self.printed_messages = {}
+        self.recent_lines = []  # Keep track of recent lines
+        self.max_recent_lines = 100  # Limit the number of tracked lines
+
+        # Control the running state
+        self.running = False
+        self.translation_thread = None
+
+    def apply_manual_resolution(self):
+        """Apply manual resolution settings and adjust DPI scaling."""
+        try:
+            width = int(self.width_var.get())
+            height = int(self.height_var.get())
+            if width < 800 or height < 600:  # Restrict to minimum resolution
+                raise ValueError("Resolution too low. Minimum is 800x600.")
+            scaling_factor = min(width / 1920, height / 1080)  # Adjust scaling based on 1080p baseline
+            self.set_dpi_scaling(scaling_factor)  # Use the scaling factor in the DPI method
+            messagebox.showinfo("Resolution Applied",
+                                f"Resolution set to {width}x{height} with scaling factor {scaling_factor:.2f}")
+            save_settings(self.settings)  # Save resolution after applying
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Please enter valid numbers for width and height.")
+
+    def set_dpi_scaling(self, scaling_factor=None):
+        """Set DPI scaling factor dynamically or use manual input."""
+        if scaling_factor:
+            self.root.tk.call("tk", "scaling", scaling_factor)
+        else:
+            # Automatically detect scaling from system DPI (if needed)
+            scaling_factor = self.root.winfo_fpixels('1i') / 72  # Convert DPI to scaling factor
+            self.root.tk.call("tk", "scaling", scaling_factor)
+
+        # Adjust font sizes and widget dimensions based on scaling
+        self.scaling_factor = scaling_factor
+        base_font_size = int(12 * scaling_factor)
+        header_font_size = int(20 * scaling_factor)
+        self.message_text.configure(font=("Segoe UI", base_font_size))
+        self.options_button.configure(font=("Segoe UI", int(10 * scaling_factor)))
+
+        class AutoTranslateGUI:
+            def __init__(self, root):
+                # Initialization code...
+                self.set_dpi_scaling()  # Call DPI scaling in the constructor
+
+            def set_dpi_scaling(self, scaling_factor=None):
+                """Set DPI scaling factor dynamically or use manual input."""
+                # DPI scaling logic...
+
+            def apply_manual_resolution(self):
+                """Apply manual resolution settings and adjust DPI scaling."""
+                try:
+                    width = int(self.width_var.get())
+                    height = int(self.height_var.get())
+                    scaling_factor = min(width / 1920, height / 1080)  # Adjust scaling based on 1080p baseline
+                    self.set_dpi_scaling(scaling_factor)  # Use the scaling factor in the DPI method
+                    messagebox.showinfo("Resolution Applied",
+                                        f"Resolution set to {width}x{height} with scaling factor {scaling_factor:.2f}")
+                except ValueError:
+                    messagebox.showerror("Invalid Input", "Please enter valid numbers for width and height.")
+
+    # All other functions remain the same...
+
+    def open_options_window(self):
+        # Creating a new options window
+        options_window = tk.Toplevel(self.root)
+        options_window.title("Options")
+        options_window.geometry("300x300")
+
+        # Add color buttons for channel and chat colors
+        ttk.Label(options_window, text="Channel Text Color:").pack(pady=3)
+        channel_color_button = ttk.Button(
+            options_window, text="Choose Channel Color", command=self.choose_channel_color
+        )
+        channel_color_button.pack(pady=3)
+
+        ttk.Label(options_window, text="Chat Text Color:").pack(pady=3)
+        chat_color_button = ttk.Button(
+            options_window, text="Choose Chat Color", command=self.choose_chat_color
+        )
+        chat_color_button.pack(pady=3)
+
+        # Add resolution input fields
+        ttk.Label(options_window, text="Manual Resolution Input (Width x Height):").pack(pady=3)
+        self.width_var = tk.StringVar(value=str(self.root.winfo_screenwidth()))
+        self.height_var = tk.StringVar(value=str(self.root.winfo_screenheight()))
+        ttk.Entry(options_window, textvariable=self.width_var, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Entry(options_window, textvariable=self.height_var, width=10).pack(side=tk.LEFT, padx=5)
+
+        # Save resolution button
+        save_resolution_button = ttk.Button(
+            options_window, text="Apply Resolution", command=self.apply_manual_resolution
+        )
+        save_resolution_button.pack(pady=3)
+
+        # Add a button for credits
+        credit_button = ttk.Button(
+            options_window, text="About", command=self.show_credit
+        )
+        credit_button.pack(pady=10)
+
+    import webbrowser
+    import tkinter as tk
+    from tkinter import ttk
+
+    def show_credit(self):
+        # This function creates a pop-up window with the credit information
+        credit_window = tk.Toplevel(self.root)
+        credit_window.title("About This Tool")
+        credit_window.geometry("300x200")
+
+        # Add the credit text to the pop-up window
+        credit_text = """Auto Translate Tool
+        Developed by [Andrew Adam]
+        Visit us on Patreon for updates!
+
+        Thank you for using this tool!
+        """
+
+        # Display the text as a label
+        credit_label = tk.Label(credit_window, text=credit_text, font=("Segoe UI", 12), justify=tk.LEFT)
+        credit_label.pack(padx=20, pady=10)
+
+        # Create a clickable hyperlink
+        patreon_link = "https://www.patreon.com/Mrbeefcode?utm_campaign=creatorshare_fan"
+
+        # Create a label for the hyperlink
+        link_label = tk.Label(credit_window, text="Visit our Patreon", fg="blue", font=("Segoe UI", 12, "underline"))
+
+        # Bind the click event to open the URL in a web browser
+        link_label.bind("<Button-1>", lambda e: webbrowser.open(patreon_link))
+        link_label.pack(padx=20, pady=5)
+
+        # Add a button to close the window
+        close_button = ttk.Button(credit_window, text="Close", command=credit_window.destroy)
+        close_button.pack(pady=10)
+
+    def choose_channel_color(self):
+        color_code = colorchooser.askcolor(title="Choose Channel Text Color")[1]
+        if color_code:
+            self.settings["channel_color"] = color_code
+            save_settings(self.settings)
+
+    def choose_chat_color(self):
+        color_code = colorchooser.askcolor(title="Choose Chat Color")[1]
+        if color_code:
+            self.settings["chat_color"] = color_code
+            save_settings(self.settings)
+
+    def update_language(self, event=None):
+        self.settings["language"] = self.language_var.get()
+        save_settings(self.settings)
+        self.message_text.insert(tk.END, f"\nLanguage set to: {self.settings['language']}\n")
+        self.message_text.see(tk.END)
+
+    def update_show_original(self):
+        self.settings["show_original"] = self.show_original_var.get()
+        save_settings(self.settings)
+        self.message_text.insert(tk.END, f"\nShow Original Text: {'Enabled' if self.settings['show_original'] else 'Disabled'}\n")
+        self.message_text.see(tk.END)
+
+    def update_print_translated_only(self):
+        self.settings["print_translated_only"] = self.print_translated_only_var.get()
+        save_settings(self.settings)
+
+    def update_check_interval(self):
+        self.settings["check_interval"] = self.interval_var.get()
+        save_settings(self.settings)
+        self.message_text.insert(tk.END, f"\nCheck Interval set to: {self.settings['check_interval']} seconds\n")
+        self.message_text.see(tk.END)
+
+    def update_auto_send(self):
+        self.settings["auto_send"] = self.auto_send_var.get()
+        save_settings(self.settings)
+
+    def set_perimeter(self):
+        self.message_text.insert(tk.END, "\nPlease hover over the top-left corner and hold for 2 seconds.\n")
+        self.root.update()
+        top_left = self.get_mouse_position_after_delay(2)
+        self.message_text.insert(tk.END,
+                                 f"Top-left corner: {top_left}\nPlease hover over the bottom-right corner and hold for 2 seconds.\n")
+        self.root.update()
+        bottom_right = self.get_mouse_position_after_delay(2)
+        self.settings["perimeter"] = (top_left, bottom_right)
+        self.perimeter_label.config(text=str(self.settings["perimeter"]))
+        self.message_text.insert(tk.END, f"Your chat box is defined as: {self.settings['perimeter']}\n")
+        save_settings(self.settings)
+        self.message_text.see(tk.END)
+
+    def set_chat_bar(self):
+        self.message_text.insert(tk.END, "\nPlease hover over the chat bar and hold for 2 seconds.\n")
+        self.root.update()
+        chat_bar = self.get_mouse_position_after_delay(2)
+        self.settings["chat_bar"] = chat_bar
+        self.chat_bar_label.config(text=str(self.settings["chat_bar"]))
+        self.message_text.insert(tk.END, f"Your chat bar is defined as: {self.settings['chat_bar']}\n")
+        save_settings(self.settings)
+        self.message_text.see(tk.END)
+
+
+    def get_mouse_position_after_delay(self, delay):
+        start_time = time.time()
+        initial_position = pyautogui.position()
+
+        while time.time() - start_time < delay:
+            current_position = pyautogui.position()
+            if current_position != initial_position:
+                start_time = time.time()
+                initial_position = current_position
+
+        return pyautogui.position()
+
+    def capture_chat_box_text(self):
+        if not self.settings["perimeter"] or not self.running:
+            return
+
+        top_left, bottom_right = self.settings["perimeter"]
+        bbox = (top_left[0], top_left[1], bottom_right[0], bottom_right[1])
+
+        try:
+            screenshot = ImageGrab.grab(bbox=bbox)
+            processed_image = preprocess_image(screenshot)
+            text = pytesseract.image_to_string(processed_image, lang='fra', config='--psm 6')
+
+            # Split lines and filter for recent duplicates
+            lines = text.split("\n")
+            unique_lines = [line for line in lines if line.strip()]
+
+            for line in unique_lines:
+                # Check for near-duplicates using SequenceMatcher
+                if any(difflib.SequenceMatcher(None, recent_line, line).ratio() > 0.75 for recent_line in
+                       self.recent_lines):
+                    continue  # Skip lines with similarity > 75%
+                self.recent_lines.append(line)
+
+                # Maintain recent_lines size
+                if len(self.recent_lines) > self.max_recent_lines:
+                    self.recent_lines.pop(0)
+
+                self.filter_and_translate_text(line)
+        except Exception as e:
+            self.message_text.insert(tk.END, f"\nError capturing text: {e}\n")
+            self.message_text.see(tk.END)
+
+    def filter_and_translate_text(self, text):
+        user_language = self.settings["language"]
+        print_translated_only = self.settings["print_translated_only"]
+
+        # Custom dictionary for corrections and direct translations
+        correction_dict = {
+            "vend": "sell",
+            "dispo": "available",
+            "grp": "group",
+            "pr": "for",
+            "xp": "experience",
+            "av": "for sell",
+            "Dj": "Dungeon",
+            "echange": "exchange",
+            "lvl": "level",
+            "tp": "teleport",
+            "qqn": "someone",
+            "mp": "message",
+            "kk": "thousands",
+            "u": "unit",
+            "recrute": "recruit",
+            "cherche": "searching for",
+            "dj": "dungeon",
+            "donjon": "dungeon",
+            "PM": "private message",
+            "pioute": "piwi",
+            "vite": "vitality",
+            "vit": "vitality",
+            "perco": "Perceptor",
+        }
+
+        # Keywords to detect channels
+        channel_keywords = ["Recruitment", "Trade", "Group", "Guild", "Alliance"]
+
+        # Replace abbreviations using the dictionary
+        corrected_line = " ".join([correction_dict.get(word.lower(), word) for word in text.split()])
+
+        # Detect if the line is from a channel
+        is_channel_line = any(keyword in corrected_line for keyword in channel_keywords)
+
+        try:
+            # Detect language and translate
+            detected_language = self.translator.detect(corrected_line).lang
+            if detected_language != user_language:
+                translated = self.translator.translate(corrected_line, src=detected_language, dest=user_language).text
+                tag = "channel_color" if is_channel_line else "chat_color"
+                self.message_text.insert(tk.END, f"{translated}\n", tag)
+
+            else:
+                if not print_translated_only:
+                    tag = "channel_color" if is_channel_line else "chat_color"
+                    self.message_text.insert(tk.END, f"{corrected_line}\n", tag)
+        except Exception:
+            # Print the corrected line if translation fails
+            tag = "channel_color" if is_channel_line else "chat_color"
+            self.message_text.insert(tk.END, f"Untranslated: {corrected_line}\n", tag)
+
+        # Configure the text tags for colors
+        self.message_text.tag_config("channel_color", foreground=self.settings["channel_color"])
+        self.message_text.tag_config("chat_color", foreground=self.settings["chat_color"])
+
+        self.message_text.see(tk.END)
+
+    def paste_and_translate(self):
+        user_message = self.paste_translate_input.get()
+        target_language = self.settings.get("language", "en")
+
+        if not user_message.strip():
+            messagebox.showwarning("Empty Input", "Please paste a message to translate.")
+            return
+
+        try:
+            # Translate the pasted message
+            translated_message = self.translator.translate(user_message, dest=target_language).text
+
+            # Display the translated message in the chat box
+            self.message_text.insert(tk.END, f"Pasted Translated Message: {translated_message}\n")
+            self.message_text.see(tk.END)
+
+        except Exception as e:
+            messagebox.showerror("Translation Error", f"An error occurred during translation: {e}")
+
+    def auto_scroll(self, event):
+        self.message_text.see(tk.END)
+
+    def clear_chat(self):
+        self.message_text.delete("1.0", tk.END)
+
+    def set_timer(self):
+        """Set and start the auto-clear timer."""
+        try:
+            auto_clear_time = int(self.auto_clear_time_var.get())
+            if auto_clear_time >= 0:
+                self.settings["auto_clear_time"] = auto_clear_time
+                save_settings(self.settings)
+
+                # Start the auto-clear timer
+                self.start_auto_clear_timer()
+
+                messagebox.showinfo("Timer Set", f"Auto clear timer set to {auto_clear_time} seconds.")
+            else:
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning("Invalid Timer", "Please enter a valid time (0 or greater).")
+
+    def translate_and_send(self):
+        user_message = self.user_input.get()
+        target_language = self.translate_to_var.get()
+
+        if not user_message.strip():
+            messagebox.showwarning("Empty Message", "Please enter a message to translate and send.")
+            return
+
+        try:
+            # Translate the message
+            translated_message = self.translator.translate(user_message, src="en", dest=target_language).text
+
+            # If auto-send is enabled, perform the actions
+            if self.auto_send_var.get() and self.settings.get("chat_bar"):
+                chat_bar_coords = self.settings["chat_bar"]
+
+                pyautogui.click(chat_bar_coords)
+                time.sleep(0.2)
+                pyautogui.typewrite(translated_message)
+                time.sleep(0.3)
+                pyautogui.press("enter")  # Only press enter if auto-send is enabled
+
+            # Show the translated message in the GUI
+            self.message_text.insert(tk.END, f"Translated Message: {translated_message}\n")
+            self.message_text.see(tk.END)
+
+            # Clear the user input box
+            self.user_input.delete(0, tk.END)
+
+        except Exception as e:
+            messagebox.showerror("Translation Error", f"An error occurred during translation: {e}")
+
+    def handle_enter_key(self, event):
+        self.translate_and_send()
+
+    def start_translation(self):
+        if not self.running:
+            self.running = True
+            self.translation_thread = threading.Thread(target=self.translation_loop, daemon=True)
+            self.translation_thread.start()
+
+    def stop_translation(self):
+        self.running = False
+        if self.translation_thread and self.translation_thread.is_alive():
+            self.translation_thread.join(timeout=1)
+            self.translation_thread = None
+
+    def translation_loop(self):
+        while self.running:
+            self.capture_chat_box_text()
+            time.sleep(self.settings["check_interval"])
+
+    def start_auto_clear_timer(self):
+        """Start or continue the auto-clear timer."""
+        if self.settings["auto_clear_time"] > 0:
+            # Decrement the timer
+            self.settings["auto_clear_time"] -= 1
+
+            # Update the timer display if necessary
+            self.auto_clear_entry.delete(0, tk.END)
+            self.auto_clear_entry.insert(0, self.settings["auto_clear_time"])
+
+            # Check again in 1 second
+            self.root.after(1000, self.start_auto_clear_timer)
+        else:
+            # When timer hits 0, clear the chat
+            self.clear_chat()
+            messagebox.showinfo("Chat Cleared", "The chat has been cleared automatically.")
+
+
+# Other imports, classes, and functions are defined here...
+
+if __name__ == "__main__":
+    # Create the Tkinter root window
+    root = tk.Tk()
+
+    try:
+        root.iconbitmap(icon_path)  # Use the dynamically determined path
+    except Exception as e:
+        print(f"Error loading icon: {e}")
+
+    # Create and run the AutoTranslateGUI application
+    app = AutoTranslateGUI(root)
+    root.bind("<Return>", app.handle_enter_key)
+    root.mainloop()
